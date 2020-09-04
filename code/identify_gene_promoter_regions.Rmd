@@ -1,0 +1,519 @@
+---
+title: "Identify gene promoter regions"
+author: "Walter Muskovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: journal
+    df_print: paged
+    toc: true
+    toc_float: true
+    collapsed: false
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r global_options, include=FALSE}
+#knitr::opts_knit$set(root.dir = normalizePath(".."), tidy = TRUE, warning = FALSE, message = FALSE, cache = TRUE, cache.lazy = FALSE)
+```
+
+The source R Markdown document is available here: `r xfun::embed_file('code/identify_gene_promoter_regions.Rmd')`.
+# Load R packages
+```{r load_packages}
+suppressMessages(library(tidyverse))
+suppressMessages(library(AnnotationHub))
+suppressMessages(library(rtracklayer))
+suppressMessages(library(glue))
+suppressMessages(library(biomaRt))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(parallel))
+suppressMessages(library(TFBSTools))
+suppressMessages(library(JASPAR2018))
+suppressMessages(library(Rsamtools))
+```
+
+# Identify protein-coding TSSs
+Select TSS with the highest FANTOM CAT transcription initiation evidence score (TIEScore).
+```{r coding_TSS, cache=TRUE}
+ # If the data directory doesn't already exist, create it
+if(!dir.exists("data")){ dir.create(file.path("data"), showWarnings = FALSE) }
+
+# Obtain FANTOM CAT robust annotation if not already done
+if(!file.exists("data/FANTOM_CAT.lv3_robust.gtf.gz")){
+  download.file(url="http://fantom.gsc.riken.jp/5/suppl/Hon_et_al_2016/data/assembly/lv3_robust/FANTOM_CAT.lv3_robust.gtf.gz", destfile = "data/FANTOM_CAT.lv3_robust.gtf.gz")
+}
+
+# Select protein-coding tx TSS that has the greatest TIEScore support
+# Transcription Initiation Evidence Score (TIEScore) is a custom metric produced for FANTOM CAT to quantify the likelihood that a CAGE transcription start site is genuine. We select the transcript with the highest TIEScore.
+FANTOM_TSS <- as_tibble(readGFF("data/FANTOM_CAT.lv3_robust.gtf.gz")) %>%
+  group_by(gene_id) %>% 
+  mutate(geneClass=unique(geneClass)[1], geneSuperClass=unique(geneSuperClass)[1], gene_name=unique(gene_name)[1]) %>% # add to all rows of gene annotation
+  mutate(number_entries = dplyr::n()) %>% # Should be at least three entries for a gene (gene + transcript + exon)
+  filter(number_entries>2) %>%
+  arrange(desc(TIEScore)) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>% 
+  filter(geneSuperClass=="all_mRNA" & str_detect(gene_id, "ENSG")) %>% # Exclude "CATG___" genes, which appear to be lncRNAs that have been marked as having coding potential
+  filter(type=="transcript" & seqid%in%c(glue('chr{1:22}'), glue('chr{c("X","Y","M")}'))) %>% # restrict to reference chromosomes
+  dplyr::select(seqid, start, end, strand, gene_id, gene_name, TIEScore) %>%
+  arrange(as.character(seqid), start) %>%
+  mutate(gene_id = str_replace_all(gene_id, "ENSGR", "ENSG")) %>% # changes 7 gene IDs from pseudoautosomal regions
+  mutate(end = case_when(strand=="+" ~ start, TRUE ~ end), # Change start and end coordinates from tx start/end to TSS
+         start = case_when(strand=="+" ~ start, TRUE ~ end),
+         ensembl_gene_id = str_split_fixed(gene_id,"[.]",2)[,1]) %>%
+  dplyr::select(-gene_id)
+
+# What information do we have?
+head(FANTOM_TSS)
+# How many genes?
+nrow(FANTOM_TSS)
+#[1] 19002
+```
+
+# Add HGNC and NCBI gene IDs
+```{r biomaRt, cache=TRUE}
+# Get gene info from biomaRt
+if(!file.exists("data/biomaRt_query.rds")){
+gene_info <- getBM(attributes = c("ensembl_gene_id", "ensembl_gene_id_version", "percentage_gene_gc_content", "hgnc_id", "hgnc_symbol", "entrezgene_id"), 
+      filters = "ensembl_gene_id", 
+      values = FANTOM_TSS$ensembl_gene_id, 
+      mart = useMart(biomart="ENSEMBL_MART_ENSEMBL", host="sep2019.archive.ensembl.org", path="/biomart/martservice", dataset="hsapiens_gene_ensembl"))
+saveRDS(gene_info, "data/biomaRt_query.rds")
+} else {
+  gene_info <- readRDS("data/biomaRt_query.rds")
+}
+
+# Sometimes more than one NCBI gene ID (entrezgene_id) is returned. In these cases, collapse to one row and join values separated by commas
+gene_info <- gene_info %>% 
+  group_by(ensembl_gene_id) %>%
+  summarise(ensembl_gene_id_version = paste(unique(ensembl_gene_id_version), collapse=", "),
+            percentage_gene_gc_content = paste(unique(percentage_gene_gc_content), collapse=", "),
+            hgnc_id = paste(unique(hgnc_id), collapse=", "),
+            hgnc_symbol = paste(unique(hgnc_symbol), collapse=", "),
+            entrezgene_id = paste(unique(entrezgene_id), collapse=", ")) %>%
+  ungroup()
+
+# Note that some ENSEMBL gene IDs present in hg19 are no longer in the current version of ENSEMBL
+dim(gene_info)
+dim(FANTOM_TSS)
+
+# Join by ensembl_gene_id
+FANTOM_TSS <- merge(x = FANTOM_TSS, y = gene_info, by = "ensembl_gene_id", all.x = FALSE) %>%
+  arrange(as.character(seqid), start)
+
+# Set column names
+colnames(FANTOM_TSS) <- c("ensembl_gene_id", "TSS_chromosome", "TSS_start", "TSS_end", "TSS_strand","FANTOM_gene_name", "TIEScore", "ensembl_gene_id_version", "percentage_gene_gc_content", "HGNC_ID", "HGNC_Symbol", "NCBI_gene_ID")
+
+# clean up
+rm(gene_info)
+```
+
+# DNase peaks near TSSs
+Import DNase narrowPeak ranges from the Roadmap Epigenomics project.
+```{r import-DNase, tidy=TRUE, warning=FALSE, message=FALSE, cache=TRUE}
+# Get annotation hub
+ahub <- AnnotationHub()
+snapshotDate(ahub)
+# [1] "2019-10-29"
+
+# Create "promoter" GRanges - 5Kb interval centred on the TSS
+gene_promoters <- promoters(makeGRangesFromDataFrame(FANTOM_TSS, keep.extra.columns = TRUE), upstream = 2500, downstream = 2500)
+
+# Extract Roadmap Epigenomics Project DNase narrowPeak records for 111 uniformly processed human epigenomes (53 have DNase-seq data available)
+npDNase <- query(ahub, c("EpigenomeRoadMap","Narrow DNasePeaks for consolidated epigenomes", "macs2"))
+# How many files returned?
+length(npDNase)
+# Take a quick look
+head(npDNase)
+# List all of the AnnotationHub identifiers for reproducibility
+names(npDNase)
+
+# Retrieve all of the narrowPeak DNase data as GRanges, keeping only the ranges that overlap our annotated promoters (promoter_hg19)
+# Define GRanges to hold just the narrowPeak regions that overlap promoters
+if(!file.exists("data/DNase_narrowPeak_overlap_promoters.rds")){
+  np_promoter <- GRanges()
+  for(i in 1:length(npDNase)){
+    # Import narrowPeak file
+    np <- npDNase[[i]]
+    # Add tissue info
+    np$tissue <- mcols(npDNase)$tags[[i]][8]
+    # Normalise scores to be between zero and one
+    scores <- np$pValue
+    scores <- scores - min(scores)
+    scores <- scores/max(scores)
+    np$norm_score <- scores
+    # Restrict to the subset of peaks that overlaps a protein-coding promoter region and add to np_promoter
+    np_promoter <- c(np_promoter, np[overlapsAny(np, gene_promoters)])
+    # updata
+    print(glue('Finished processing file {i} of {length(npDNase)}'))
+  }
+  saveRDS(np_promoter, "data/DNase_narrowPeak_overlap_promoters.rds")
+  rm(i, np_promoter, np)
+}
+
+#clean up
+rm(ahub, npDNase)
+```
+
+# Identify single DNase peak position for each gene
+Quick visual exploration.
+```{r visualise_DNase_narrowPeak_data, fig.width=12, fig.height=15, cache=TRUE}
+# Import DNase narrowPeak data
+np_promoter <- readRDS("data/DNase_narrowPeak_overlap_promoters.rds")
+
+# Define function that accepts a gene ID and creates some simple plots of the promoter and nearby DNase narrowPeak ranges
+plot_DNase <- function(gene_name, three_prime_width=2500, five_prime_width=2500){
+  # Get the promoter GRanges for the gene of interest
+  goi <- gene_promoters[gene_promoters$HGNC_Symbol==gene_name]
+  # Find DNase narrowPeaks that overlap the promoter
+  overlapping_narrowPeaks <- np_promoter[overlapsAny(np_promoter,goi)]
+  # Order GRanges by norm_score
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[order(overlapping_narrowPeaks$norm_score, decreasing = TRUE)]
+  # Create vector of colour values, based on the narrowPeak$norm_score value
+  plot_cols <- colorRampPalette(brewer.pal(11,"Spectral"))(100)[as.numeric(cut(overlapping_narrowPeaks$norm_score,breaks = 100))]
+  
+  ## Plot the point-source called for each DNase narrowPeak range
+  # Create empty plot
+  par(mar=c(5.1,25,4.1,2.1)) # bottom, left, top and right margins
+  plot("",xlim=c(start(goi)-three_prime_width, end(goi)+five_prime_width), ylim=c(-2,length(overlapping_narrowPeaks)+1), ylab="", yaxt="n", xlab="chromosome position",
+       main=gene_name)
+  axis(side=2, labels = overlapping_narrowPeaks$tissue, at = 1:length(overlapping_narrowPeaks)+0.5,las=2)
+  rect(xleft = start(goi), ybottom = -2, xright = end(goi), ytop = 0, col = "red", border=NA)
+  # Plot points for point-source of each narrowPeak
+  for(i in 1:length(overlapping_narrowPeaks)){
+    points(start(overlapping_narrowPeaks[i]) + overlapping_narrowPeaks[i]$peak, i+0.5, pch=21, col="black", bg=plot_cols[i], cex=1.5)
+  }
+
+  # Add a horizontal dashed red line, indicating where the cumulative fraction of norm_score values across all narrowPeak ranges exceeds 0.75 (i.e. the normalised scores of the narrowPeak ranges below this line make up 75% of the total)
+  cum_sum_cutoff <- which(cumsum(overlapping_narrowPeaks$norm_score)/sum(overlapping_narrowPeaks$norm_score)>0.75)[1]
+  abline(h=cum_sum_cutoff, col="red", lty=2)
+  # Restrict the DNase narrowPeaks to those below the line
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[1:cum_sum_cutoff]
+  # Restrict the narrowPeak ranges to just the point source
+  start(overlapping_narrowPeaks) <- start(overlapping_narrowPeaks) + overlapping_narrowPeaks$peak
+  end(overlapping_narrowPeaks) <- start(overlapping_narrowPeaks)
+  
+  # Check whether the point sources are spread across a region >=50bp - otherwise a rolling mean can't be calculated 
+  if(diff(range(start(overlapping_narrowPeaks)))>=50){
+  # Create a data frame to hold the rolling mean of the norm_score values using a 50bp sliding window
+  roll_mean_scores <- data.frame(pos = min(start(overlapping_narrowPeaks)):max(start(overlapping_narrowPeaks)),
+                  score = 0)
+  # Add the norm-score values
+  for(i in 1:length(overlapping_narrowPeaks)){
+    position <- roll_mean_scores$pos==start(overlapping_narrowPeaks[i])
+    roll_mean_scores$score[position] <- roll_mean_scores$score[position] + overlapping_narrowPeaks[i]$norm_score
+  }
+  # Calculate the position where the rolling mean of norm_scores is greatest
+  roll_mean_peak <- roll_mean_scores$pos[1] + which.max(zoo::rollmean(x=roll_mean_scores$score, k=50))+25
+  # Add two blue lines to mark the the 50bp region around the roll_mean_peak
+  abline(v=roll_mean_peak-25, col="blue", lty=2);
+  abline(v=roll_mean_peak+25, col="blue", lty=2);
+
+  # Restrict the narrowPeaks point sources to those within the selected region (those peaks below the dashed red line and between the two solid blue lines)
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[(start(overlapping_narrowPeaks) > roll_mean_peak-25) & (start(overlapping_narrowPeaks) < roll_mean_peak+25)]
+  }
+  
+  # Calculate weighted mean position of the remaining peaks, using the norm_scores as the weights
+  centre_pos <-  as.integer(round(weighted.mean(x = start(overlapping_narrowPeaks), w = overlapping_narrowPeaks$norm_score), 0))
+  # Mark the position of the DNase peak centre with a thick blue line
+  abline(v=centre_pos, col="blue", lwd=2)
+  par(mar=c(5.1, 4.1, 4.1, 2.1))
+}
+
+plot_DNase("PAX6")
+plot_DNase("GAPDH")
+plot_DNase("MMP3")
+
+# Clean up
+rm(plot_DNase)
+```
+
+Our approach of identifying the strongest DNase peak appears to be working fairly well for now. Proceed to apply the method to all genes, adding the position of the DNase peak to the FANTOM_TSS data frame.
+
+```{r}
+# Define function to identify peaks
+identify_DNase <- function(row_num){
+  # Get the promoter GRanges for the gene of interest
+  goi <- gene_promoters[row_num]
+  # Find DNase narrowPeaks that overlap the promoter
+  overlapping_narrowPeaks <- np_promoter[overlapsAny(np_promoter,goi)]
+  # Order GRanges by norm_score
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[order(overlapping_narrowPeaks$norm_score, decreasing = TRUE)]
+  
+  # Check that we have at least one peak to work with, otherwise there's nothing to be done, in which case return NA
+  if(length(overlapping_narrowPeaks)==0){return(NA)}
+  
+  # identify where the cumulative fraction of norm_score values across all narrowPeak ranges exceeds 0.75 (i.e. the normalised scores of the narrowPeak ranges below this line make up 75% of the total)
+  cum_sum_cutoff <- which(cumsum(overlapping_narrowPeaks$norm_score)/sum(overlapping_narrowPeaks$norm_score)>0.75)[1]
+  # Restrict the DNase narrowPeaks
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[1:cum_sum_cutoff]
+  # Restrict the narrowPeak ranges to just the point source
+  start(overlapping_narrowPeaks) <- start(overlapping_narrowPeaks) + overlapping_narrowPeaks$peak
+  end(overlapping_narrowPeaks) <- start(overlapping_narrowPeaks)
+  
+  # Check whether the point sources are spread across a region >=50bp - otherwise a rolling mean can't be calculated 
+  if(diff(range(start(overlapping_narrowPeaks)))>=50){
+  # Create a data frame to hold the rolling mean of the norm_score values using a 50bp sliding window
+  roll_mean_scores <- data.frame(pos = min(start(overlapping_narrowPeaks)):max(start(overlapping_narrowPeaks)),
+                  score = 0)
+  # Add the norm-score values
+  for(i in 1:length(overlapping_narrowPeaks)){
+    position <- roll_mean_scores$pos==start(overlapping_narrowPeaks[i])
+    roll_mean_scores$score[position] <- roll_mean_scores$score[position] + overlapping_narrowPeaks[i]$norm_score
+  }
+  # Calculate the position where the rolling mean of norm_scores is greatest
+  roll_mean_peak <- roll_mean_scores$pos[1] + which.max(zoo::rollmean(x=roll_mean_scores$score, k=50))+25
+  
+  # Restrict the narrowPeaks point sources to those within 50bp of the peak
+  overlapping_narrowPeaks <- overlapping_narrowPeaks[(start(overlapping_narrowPeaks) > roll_mean_peak-25) & (start(overlapping_narrowPeaks) < roll_mean_peak+25)]
+  }
+  
+  # Calculate weighted mean position of the remaining peaks, using the norm_scores as the weights
+  centre_pos <-  as.integer(round(weighted.mean(x = start(overlapping_narrowPeaks), w = overlapping_narrowPeaks$norm_score), 0))
+  return(centre_pos)
+}
+
+# Apply function to identify dominant DNase peak for all genes - run on cluster
+if(!file.exists("data/centre_pos.rds")){
+  centre_pos <- unlist(lapply(1:length(gene_promoters), identify_DNase))
+  saveRDS(centre_pos, "data/centre_pos.rds")
+} else {
+  centre_pos <- readRDS("data/centre_pos.rds")
+}
+
+# Add to FANTOM_TSS data frame and save out
+if(!file.exists("data/TSS_DNase.rds")){
+  # Add main DNase peak position
+  FANTOM_TSS <- mutate(FANTOM_TSS, main_DNase_peak_pos = centre_pos)
+  # Make sure there are no duplicated HGNC gene names and a main DNase peak was identified
+  FANTOM_TSS <- filter(FANTOM_TSS, !duplicated(HGNC_Symbol) & HGNC_Symbol!="" & complete.cases(main_DNase_peak_pos))
+  saveRDS(FANTOM_TSS, "data/TSS_DNase.rds")
+} else {
+  FANTOM_TSS <- readRDS("data/TSS_DNase.rds")
+}
+# Glance at data
+head(FANTOM_TSS)
+
+#Clean up
+rm(identify_DNase, centre_pos)
+```
+
+# Scan promoters for TFBS
+We can now search for transcription factor binding site (TFBS) motifs using the `searchSeq` function from the [TFBSTools package](https://bioconductor.org/packages/release/bioc/html/TFBSTools.html) within the identified DNase peak regions for each gene.
+```{r, cache=TRUE}
+# Obtain human genome sequence if not already done
+if(!file.exists("data/hg19.fa.gz")){
+  download.file(url="https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz", destfile = "data/hg19.fa.gz")
+}
+# build hg19 FASTA index - if it doesn't already exist
+if(!file.exists("data/hg19.fa.bgz.fai")){
+  bgzip("data/hg19.fa.gz")
+  indexFa("data/hg19.fa.bgz")
+}
+# Create a reference to the indexed fasta file
+hg19_fasta <- FaFile("data/hg19.fa.bgz", index = "data/hg19.fa.bgz.fai")
+
+# Define 1Kb promoter ranges 
+gene_promoters <- filter(FANTOM_TSS, complete.cases(main_DNase_peak_pos)) %>%
+  mutate(seqnames = TSS_chromosome, start = main_DNase_peak_pos-500, end = main_DNase_peak_pos + 500, strand = TSS_strand) %>%
+  dplyr::select(seqnames, start, end, strand, ensembl_gene_id) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+# Check that we haven't created ranges that extend beyond the chromosome start/end
+chromosome_ranges <- GRanges(seqinfo(hg19_fasta))
+ranges_within_chrom <- findOverlaps(gene_promoters, chromosome_ranges, type="within")
+# Which ranges are outside the chromosome start/end
+gene_promoters[which(!1:length(gene_promoters)%in%from(ranges_within_chrom))]
+# Two ranges on chrM will cause problems
+problematic_ranges <- gene_promoters[which(!1:length(gene_promoters)%in%from(ranges_within_chrom))]
+# We will remove these two genes
+gene_promoters <- gene_promoters[!gene_promoters$ensembl_gene_id%in%problematic_ranges$ensembl_gene_id]
+if(!file.exists("data/TSS_DNase_filtered.rds")){
+  FANTOM_TSS <- filter(FANTOM_TSS, !ensembl_gene_id%in%problematic_ranges$ensembl_gene_id)
+  saveRDS(FANTOM_TSS, "data/TSS_DNase_filtered.rds")
+} else {
+  FANTOM_TSS <- readRDS("data/TSS_DNase_filtered.rds")
+}
+
+# Extract DNA sequences of our 1Kb promoter intervals to get a DNAStringSet
+if(!file.exists("data/promoter_seq.rds")){
+  promoter_seq <- getSeq(hg19_fasta, gene_promoters)
+  names(promoter_seq) <- gene_promoters$ensembl_gene_id
+  saveRDS(promoter_seq, "data/promoter_seq.rds")
+} else {
+  promoter_seq <- readRDS("data/promoter_seq.rds")
+}
+# Get PFMatrixList with transcription factor binding motifs
+opts <- list()
+opts[["species"]] <- 9606
+opts[["collection"]] <- "CORE"
+PFMatrixList <- getMatrixSet(JASPAR2018, opts)
+# Convert to PWMatrix for use with the searchSeq function
+PWMatrixList <- toPWM(PFMatrixList)
+saveRDS(PWMatrixList, "data/PWMatrixList.rds")
+
+# Save out a data frame which contains; the names of the files which will contain the searchseq results (produced in the following section) and the name of the transcription factor
+TF_ids <- data.frame(file_name = glue('{str_split_fixed(names(PWMatrixList),"[.]",2)[,1]}.rds'),
+                     TF = as.character(sapply(PFMatrixList, function(x) x@name)))
+saveRDS(TF_ids, "data/TF_ids.rds")
+
+## The following code will search the 1Kb promoter sequences for each of the 452 TFBS we imported from the JASPAR2018 database. We then sum the scores for each TFBS and promoter and save these out as a list of was run with an array job on the HPC
+```
+```{bash submit_TFBS_search.sh, eval=FALSE}
+#!/bin/bash
+#$ -S /bin/bash
+#$ -pe smp 1
+#$ -cwd
+#$ -V
+#$ -q short.q
+#$ -r yes
+#$ -l mem_requested=15G
+#$ -N TFBS_search
+#$ -t 1-452:1
+
+conda activate base_r
+Rscript TFBS_search.R ${SGE_TASK_ID}
+```
+```{r TFBS_search.R, eval=FALSE}
+#!/usr/bin/env Rscript
+args = commandArgs(trailingOnly=TRUE)
+
+# Search for TFBS in promoter sequences
+setwd("../data/")
+library(TFBSTools)
+library(dplyr)
+library(glue)
+library(stringr)
+PWMatrixList <- readRDS("PWMatrixList.rds")
+promoter_seq <- readRDS("promoter_seq.rds")
+motif_positions <- searchSeq(x = PWMatrixList[as.integer(args)], subject=promoter_seq, min.score="80%", strand="*")
+
+# Define a function to return a vector of length 1001, containing the summed searchSeq scores
+# Note that when we say "score" we are taking the relative score (between 0.0 to 1.0) with respect of the score range of the associated pattern (PWMatrix) i.e. a perfect match would be 1.
+get_motif_score_vec <- function(inputSiteSet){
+  start_pos <- start(inputSiteSet)
+  end_pos <- end(inputSiteSet)
+  scores <- relScore(inputSiteSet)
+  # Create a vector with the required dimensions
+  inputSiteSet <- rep(0, 1001)
+  # If there are scores, add them to the vector we just created
+  if(length(scores)!=0){
+  for(i in 1:length(scores)){
+    inputSiteSet[start_pos[i]:end_pos[i]] <- inputSiteSet[start_pos[i]:end_pos[i]] + scores[i]
+  }
+  }
+  return(inputSiteSet)
+  }
+
+# Save out as a SiteSetList object - in case we want process the results differently in future.
+saveRDS(motif_positions, glue("motif_positions_{args[1]}.rds"))
+# Now save out summed searchSeq scores as a data frame
+motif_positions <- lapply(motif_positions, get_motif_score_vec) %>% do.call(rbind, .) %>% data.frame()
+# Set row names as gene IDs
+row.names(motif_positions) <- names(promoter_seq)
+#Set column names as positions relative to the main DNase peak
+colnames(motif_positions) <- -500:500
+# Save out the data frame with the name of the TFBS
+saveRDS(motif_positions, glue('{str_split_fixed(names(PWMatrixList),"[.]",2)[as.integer(args),1]}.rds'))
+```
+
+Plotting function requires: 
+ - input data frame for a particular transcription factor e.g. "MA0030.rds"
+ - TF_ids data frame, which maps the file names to the transcription factor names e.g. "MA0030.rds" =	FOXF2
+ - The FANTOM_TSS data frame which contains the gene names
+ - gene names of genes of interest
+ 
+- Could use bootstrap to obtain a confidence interval: sample the same number of genes in the group containing the genes of interest
+
+```{r}
+FANTOM_TSS <- readRDS("data/TSS_DNase_filtered.rds")
+TF_ids <- readRDS("data/TF_ids.rds")
+
+plot_TF <- function(TF="SRY", goi, num_bootstrap = 100){
+  ## Import TFBS data for specified TF
+  input_df <- readRDS(glue('data/{TF_ids$file_name[which(TF_ids$TF==TF)]}'))
+  
+  ## Bootstrap ctrl intervals (5% and 95%)
+  ctrl <- input_df[FANTOM_TSS$ensembl_gene_id[!FANTOM_TSS$HGNC_Symbol%in%goi],]
+  ctrl <- replicate(num_bootstrap, colMeans(ctrl[sample(1:nrow(ctrl), length(goi)),])) %>%
+    matrixStats::rowQuantiles(., probs=c(0.05,0.95))
+  
+  #ctrl<-colMeans(input_df)
+  
+  ## Genes of interest data
+  # Change gene names to ENSEMBL gene IDs
+  goi <- FANTOM_TSS$ensembl_gene_id[which(FANTOM_TSS$HGNC_Symbol%in%goi)]
+  # Subset data for just the genes of interest
+  goi <- input_df[match(goi, row.names(input_df)),]
+  # Take the mean
+  goi <- colMeans(goi)
+
+  ## Plot
+  # Create empty plot
+  plot("", xlim=c(-500,500), ylim=range(ctrl, goi), main=TF, xlab="Distance from promoter main DNase peak", ylab="relative TFBS score")
+  # Add pale red shaded area that contains the bootstrap confidence intervals
+  polygon(c(-500:500, 500:-500), c(ctrl[,"5%"], rev(ctrl[,"95%"])),col=adjustcolor("red", alpha=0.3), border = NA)
+  #lines(-500:500, ctrl, col="red")
+  # Add solid black line with the data for the genes of interest
+  lines(-500:500, goi, lwd=1)
+}
+
+# Test function - genes are just the first 1000 on chromosome 1, so we don't expect the trend to exceed the confidence interval
+set.seed(1234)
+plot_TF(TF="EBF1", goi = FANTOM_TSS$HGNC_Symbol[1:1000], num_bootstrap = 1000)
+```
+
+# Test genes ranked by repressive tendency scores
+Get repressive tendency scores, from recent publication by Shim et al (Nathan Palpant lab - The University of Queensland).
+```{r get_RTS_scores}
+library(readxl)
+# Download Supplemental Tables from "Comparative analysis of diverse cell states establishes an epigenetic basis for inferring regulatory genes governing cell identity", Shim et al, https://doi.org/10.1101/635516 
+if(!file.exists("data/media-1.zip")){
+download.file(url="https://www.biorxiv.org/content/biorxiv/early/2019/05/18/635516/DC1/embed/media-1.zip?download=true",
+              destfile = "data/media-1.zip",
+              method = "libcurl")
+}
+if(!file.exists("data/Table S3.xlsx")){
+unzip("data/media-1.zip", files = "Table S3.xlsx", exdir="data/")
+}
+# import RTS scores
+RTS_scores <- read_excel("data/Table S3.xlsx", sheet = 2)
+# Have a look
+head(RTS_scores)
+```
+
+```{r}
+x<-filter(RTS_scores, Priority=="Y" & `#Gene` %in% FANTOM_TSS$HGNC_Symbol) %>% dplyr::select(`#Gene`) %>% unlist
+
+y<-TF_ids$TF[TF_ids$TF%in%x]
+
+for(i in y){
+  plot_TF(TF=i, goi = x, num_bootstrap = 100)
+  print(which(TF_ids$TF==i))
+}
+
+plot_TF(TF="CTCF", goi = x, num_bootstrap = 100)
+plot_TF(TF="REST", goi = x, num_bootstrap = 100)
+
+x <- read_csv("~/Downloads/geneset.txt", col_names = FALSE, skip = 2) %>% unlist()
+x <- x[x%in%FANTOM_TSS$HGNC_Symbol]
+plot_TF(TF="MYC", goi = x, num_bootstrap = 1000)
+
+expr_int <- read_delim("~/Downloads/expr_int.gff3", "\t", escape_double = FALSE, trim_ws = TRUE, skip = 3, col_names = FALSE) %>% filter(X3=="transcript") %>%
+  filter(str_detect(X9, "Name"))
+expr_int <- str_split_fixed(unlist(expr_int$X9),";",3)[,2]
+expr_int <- str_remove_all(expr_int, "Name=")
+expr_int <-expr_int[expr_int%in%FANTOM_TSS$HGNC_Symbol]
+for(i in TF_ids$TF[34:452]){
+  plot_TF(TF=i, goi = expr_int, num_bootstrap = 100)
+  print(which(TF_ids$TF==i))
+}
+```
+```{r}
+ahub <- AnnotationHub()
+x<-query(ahub, c("EpigenomeRoadMap"))
+xx<-mcols(x) %>% data.frame()
+xxx<-xx[str_detect(xx$title,"E001"),]
+xxx<-xx[which(str_detect(xx$rdataclass, "data.frame")),]
+```
